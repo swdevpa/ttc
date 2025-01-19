@@ -6,6 +6,11 @@ const CACHE_FOLDER = `${FileSystem.cacheDirectory}videos/`;
 const MAX_CACHE_SIZE = 500 * 1024 * 1024; // 500MB
 const MAX_CACHE_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// Add custom type for FileInfo with size
+type FileInfoWithSize = FileSystem.FileInfo & {
+  size?: number;
+};
+
 interface CacheInfo {
   uri: string;
   size: number;
@@ -106,7 +111,7 @@ export class CacheService {
     try {
       const downloadResult = await FileSystem.downloadAsync(uri, cachePath);
       if (downloadResult.status === 200) {
-        const fileInfo = await FileSystem.getInfoAsync(cachePath, { size: true });
+        const fileInfo = await getFileInfo(cachePath);
         this.cacheMap.set(uri, {
           uri,
           size: fileInfo.size || 0,
@@ -163,4 +168,8 @@ export class CacheService {
       console.error('Failed to clear all cache:', error);
     }
   }
+}
+
+async function getFileInfo(uri: string): Promise<FileInfoWithSize> {
+  return await FileSystem.getInfoAsync(uri, { size: true }) as FileInfoWithSize;
 } 

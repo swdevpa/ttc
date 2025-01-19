@@ -1,7 +1,8 @@
 import * as FileSystem from 'expo-file-system';
 import * as VideoThumbnails from 'expo-video-thumbnails';
-import { Video } from 'expo-av';
 import { Platform } from 'react-native';
+import ImageEditor from '@react-native-community/image-editor';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 
 interface ProcessedVideo {
   uri: string;
@@ -17,9 +18,20 @@ interface CompressionConfig {
   height?: number;
 }
 
+// Define a custom type that includes size
+type VideoFileInfo = {
+  exists: true;
+  uri: string;
+  size: number;
+  isDirectory: boolean;
+  modificationTime: number;
+  md5?: string;
+};
+
 export class VideoProcessor {
   private static instance: VideoProcessor;
   private processingQueue: Map<string, boolean>;
+  private readonly MAX_VIDEO_SIZE = 50 * 1024 * 1024; // 50MB
 
   private constructor() {
     this.processingQueue = new Map();
@@ -58,21 +70,33 @@ export class VideoProcessor {
 
   private async generateThumbnail(videoUri: string): Promise<string> {
     try {
+      // Generate thumbnail
       const { uri } = await VideoThumbnails.getThumbnailAsync(videoUri, {
         time: 0,
         quality: 0.7,
       });
-      return uri;
+
+      // Compress thumbnail
+      const compressedThumbnail = await manipulateAsync(
+        uri,
+        [{ resize: { width: 540 } }], // 540p is good for thumbnails
+        { compress: 0.7, format: SaveFormat.JPEG }
+      );
+
+      return compressedThumbnail.uri;
     } catch (error) {
       console.error('Error generating thumbnail:', error);
       throw new Error('Failed to generate video thumbnail');
     }
   }
 
-  private async getVideoMetadata(uri: string) {
+  private async getVideoMetadata(uri: string): Promise<VideoFileInfo> {
     try {
       const fileInfo = await FileSystem.getInfoAsync(uri, { size: true });
-      return fileInfo;
+      if (!fileInfo.exists || !('size' in fileInfo)) {
+        throw new Error('Invalid video file or size information not available');
+      }
+      return fileInfo as VideoFileInfo;
     } catch (error) {
       console.error('Error getting video metadata:', error);
       throw new Error('Failed to get video metadata');
@@ -85,37 +109,36 @@ export class VideoProcessor {
     onProgress?: (progress: number) => void
   ): Promise<string> {
     try {
-      const video = new Video.createAsync(
-        { uri },
-        { shouldPlay: false, isLooping: false },
-        false
-      );
-
       // Create output file path
       const timestamp = Date.now();
       const outputUri = `${FileSystem.cacheDirectory}compressed_${timestamp}.mp4`;
-
-      // Load video and get status
-      const status = await video.loadAsync({ uri }, {}, false);
       
-      if (!status.isLoaded || status.error) {
-        throw new Error('Failed to load video for compression');
-      }
-
-      // Set compression options
-      const options = {
-        quality: config.quality,
-        bitrate: config.bitrate,
-        width: config.width,
-        height: config.height,
-        codec: 'h264',
-        outputPath: outputUri,
-      };
-
-      // Compress video
-      await video.compressAsync(options, (progress) => {
+      // Start with reading the file in chunks
+      const chunkSize = 1024 * 1024; // 1MB chunks
+      const fileInfo = await this.getVideoMetadata(uri);
+      const totalChunks = Math.ceil(fileInfo.size / chunkSize);
+      
+      // Process chunks
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, fileInfo.size);
+        
+        // Read chunk
+        const chunk = await FileSystem.readAsStringAsync(uri, {
+          encoding: FileSystem.EncodingType.Base64,
+          position: start,
+          length: end - start
+        });
+        
+        // Write chunk (append mode)
+        await FileSystem.writeAsStringAsync(outputUri, chunk, {
+          encoding: FileSystem.EncodingType.Base64
+        });
+        
+        // Report progress
+        const progress = (i + 1) / totalChunks;
         onProgress?.(progress * 100);
-      });
+      }
 
       return outputUri;
     } catch (error) {
@@ -163,35 +186,42 @@ export class VideoProcessor {
     try {
       // Get video metadata
       const metadata = await this.getVideoMetadata(videoUri);
-      if (!metadata.exists || !metadata.size) {
-        throw new Error('Invalid video file');
-      }
       onProgress?.(10);
+
+      // Check if video needs compression
+      const needsCompression = metadata.size > this.MAX_VIDEO_SIZE;
 
       // Generate thumbnail
       const thumbnailUri = await this.generateThumbnail(videoUri);
       onProgress?.(30);
 
-      // Compress video based on size
-      const compressionConfig = this.getCompressionConfig(metadata.size);
-      const compressedUri = await this.compressVideo(
-        videoUri,
-        compressionConfig,
-        (compressProgress) => {
-          onProgress?.(30 + (compressProgress * 0.6)); // 30% to 90%
-        }
-      );
+      let processedUri: string;
+      if (needsCompression) {
+        // Compress video based on size
+        const compressionConfig = this.getCompressionConfig(metadata.size);
+        const compressedUri = await this.compressVideo(
+          videoUri,
+          compressionConfig,
+          (compressProgress) => {
+            onProgress?.(30 + (compressProgress * 0.6)); // 30% to 90%
+          }
+        );
+        
+        // Copy to cache
+        processedUri = await this.copyToCache(compressedUri, 'mp4');
+        
+        // Cleanup temporary compressed file
+        await FileSystem.deleteAsync(compressedUri, { idempotent: true });
+      } else {
+        // If no compression needed, just copy to cache
+        processedUri = await this.copyToCache(videoUri, 'mp4');
+      }
       
-      // Copy to cache
-      const processedUri = await this.copyToCache(compressedUri, 'mp4');
       onProgress?.(95);
 
       // Get final metadata
       const finalMetadata = await this.getVideoMetadata(processedUri);
       onProgress?.(100);
-
-      // Cleanup temporary compressed file
-      await FileSystem.deleteAsync(compressedUri, { idempotent: true });
 
       this.processingQueue.delete(processId);
 
@@ -199,7 +229,7 @@ export class VideoProcessor {
         uri: processedUri,
         thumbnailUri,
         duration: 0, // TODO: Implement actual duration extraction
-        size: finalMetadata.size || 0,
+        size: finalMetadata.size,
       };
     } catch (error) {
       this.processingQueue.delete(processId);

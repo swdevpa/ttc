@@ -1,10 +1,12 @@
 export interface Video {
   id: string;
+  userId: string;
   uri: string;
+  thumbnailUri: string;
   caption: string;
-  username: string;
   likes: number;
   comments: number;
-  category: string;
-  isPopular: boolean;
+  shares: number;
+  categories: string[];
+  createdAt: string;
 } 
